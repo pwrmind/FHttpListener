@@ -33,7 +33,7 @@ let loadTest (client: HttpClient) (url: string) (headers: (string * string) list
         do! semaphore.WaitAsync() |> Async.AwaitTask
         try
             let stopwatch = Stopwatch.StartNew()
-            let! response = sendRequest client HttpMethod.Post url headers body |> Async.AwaitTask
+            let! response = sendRequest client HttpMethod.Get url headers body |> Async.AwaitTask
             stopwatch.Stop()
             return (response, stopwatch.Elapsed.TotalMilliseconds)
         finally
@@ -94,11 +94,11 @@ let printResults (results: (HttpResponseMessage * float)[]) =
 // Основная функция
 [<EntryPoint>]
 let main argv =
-    let url = "http://localhost:8080/adduser"
-    let headers = [("Authorization", "Bearer +xgQTWvOGU2wTDIKzQZZGw=="); ("Content-Type", "application/json")]
-    let body = Some """{ "Email": "user@example.com", "Password": "user@example.com" }"""
-    let numRequests = 100000
-    let maxParallel = 22 // Ограничение параллелизма
+    let url = "http://localhost:8080/hello"
+    let headers = []
+    let body = Some """"""
+    let numRequests = 1000000
+    let maxParallel = 16 // Ограничение параллелизма
 
     // Настраиваем HTTP-клиент
     let handler = new SocketsHttpHandler(
