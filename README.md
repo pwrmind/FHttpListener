@@ -114,7 +114,8 @@ let isProductionReady = true // ✅ Yes!
 ```
 
 > **Contribute:** PRs welcome! Let's push this to 50k RPS 💪
-```
+
+---
 
 ### Key Performance Takeaways:
 1. **Insane throughput:** ~20k requests/second
