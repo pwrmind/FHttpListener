@@ -1,0 +1,80 @@
+﻿open System
+open System.Net.Http
+open System.Diagnostics
+open System.Text
+open System.Threading.Tasks
+
+// Функция для отправки HTTP-запроса
+let sendRequest (client: HttpClient) (method: HttpMethod) (url: string) (headers: (string * string) list) (body: string option) : Task<HttpResponseMessage> =
+    let request = new HttpRequestMessage(method, url)
+    
+    // Добавляем заголовки
+    headers |> List.iter (fun (key, value) ->
+        if key <> "Content-Type" then
+            request.Headers.Add(key, value))
+    
+    // Добавляем тело запроса, если оно есть
+    match body with
+    | Some content ->
+        let stringContent = new StringContent(content, Encoding.UTF8)
+        stringContent.Headers.ContentType <- System.Net.Http.Headers.MediaTypeHeaderValue.Parse("application/json")
+        request.Content <- stringContent
+    | None -> ()
+
+    client.SendAsync(request)
+
+// Функция высшего порядка для замера времени выполнения
+let measureTime (func: unit -> Task<'T>) : Task<float> =
+    async {
+        let stopwatch = Stopwatch.StartNew()
+        let! result = Async.AwaitTask (func()) // Выполняем переданную функцию
+        stopwatch.Stop()
+        return stopwatch.Elapsed.TotalMilliseconds // Возвращаем время в миллисекундах
+    } |> Async.StartAsTask
+
+// Функция для выполнения нагрузочного тестирования
+let loadTest (client: HttpClient) (url: string) (headers: (string * string) list) (body: string option) (numRequests: int) : Task<HttpResponseMessage array * float[]> =
+    let responseTasks = 
+        [ for _ in 1 .. numRequests do
+            yield sendRequest client HttpMethod.Post url headers body ]
+    
+    let timeTasks = 
+        [ for _ in 1 .. numRequests do
+            yield measureTime (fun () -> sendRequest client HttpMethod.Post url headers body) ]
+
+    // Ожидаем завершения всех задач и возвращаем результаты
+    async {
+        let! responses = Task.WhenAll(responseTasks) |> Async.AwaitTask
+        let! times = Task.WhenAll(timeTasks) |> Async.AwaitTask
+        return (responses, times)
+    } |> Async.StartAsTask
+
+// Функция для вывода результатов
+let printResults (responses: HttpResponseMessage[]) (times: float[]) =
+    responses
+    |> Array.iter (fun response ->
+        printfn "Status Code: %A" response.StatusCode
+        response.Dispose() // Освобождаем ресурсы после использования
+    )
+    let averageTime = Array.average times
+    printfn "Average Response Time: %f ms" averageTime
+
+// Основная функция
+[<EntryPoint>]
+let main argv =
+    let url = "http://localhost:8080/adduser" // Замените на вашу конечную точку
+    let headers = [("Authorization", "Bearer tK4Pwr53vkmop2jW/n4tSw=="); ("Content-Type", "application/json")]
+    let body = Some """{ "Email": "user@example.com" }""" // Тело запроса в формате JSON
+    let numRequests = 1000 // Количество запросов для тестирования
+
+    use client = new HttpClient()
+    
+    // Выполняем нагрузочное тестирование
+    let task = loadTest client url headers body numRequests
+    task.Wait() // Ждем завершения всех запросов
+
+    // Получаем результаты и выводим их
+    let responses, times = task.Result // Получаем массив ответов и времена выполнения
+    printResults responses times
+
+    0 // Возвращаем код завершения

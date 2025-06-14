@@ -1,0 +1,444 @@
+﻿open System
+open System.Net
+open System.Text
+open System.IO
+open System.Text.Json
+open System.Collections.Concurrent
+open System.Security.Cryptography
+
+// Тип для представления результата операции
+type Result<'T> =
+    | Success of 'T
+    | Error of message: string * statusCode: HttpStatusCode
+
+// Тип для представления данных пользователя
+type User = {
+    Email: string
+    PasswordHash: string
+    Role: string
+}
+
+// Тип для представления сессии
+type Session = {
+    Token: string
+    Username: string
+    Role: string
+    Expiry: DateTime
+}
+
+// Асинхронный логгер с буферизацией
+type Logger() =
+    let agent = MailboxProcessor.Start(fun inbox ->
+        let rec loop () = async {
+            let! (msg: string) = inbox.Receive()
+            do! Async.SwitchToNewThread()
+            printfn "[%s] %s" (DateTime.Now.ToString("o")) msg
+            return! loop()
+        }
+        loop())
+
+    member __.Log(message) = agent.Post(message)
+
+// Глобальный экземпляр логгера
+let logger = Logger()
+
+// Функция логирования
+let log (message: string) = logger.Log(message)
+
+// Хранилища данных (в памяти)
+let userStore = new ConcurrentDictionary<string, User>()
+let sessionStore = new ConcurrentDictionary<string, Session>()
+
+// Инициализация тестового пользователя
+do 
+    let salt = "s@ltV@lu3"
+    let hashedPassword = 
+        use sha = SHA256.Create()
+        Convert.ToBase64String(
+            sha.ComputeHash(Encoding.UTF8.GetBytes("password" + salt)))
+    
+    userStore.TryAdd("admin", { 
+        Email = "admin@example.com"
+        PasswordHash = hashedPassword
+        Role = "Administrator" 
+    }) |> ignore
+
+// Асинхронное хеширование пароля
+let hashPasswordAsync (password: string) = 
+    async {
+        do! Async.SwitchToThreadPool()
+        let salt = "s@ltV@lu3"
+        use sha = SHA256.Create()
+        let input = password + salt
+        let bytes = Encoding.UTF8.GetBytes input
+        let hash = sha.ComputeHash(bytes)
+        return Convert.ToBase64String(hash)
+    }
+
+// Чтение тела запроса асинхронно
+let readRequestBodyAsync (context: HttpListenerContext) = 
+    async {
+        use reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding)
+        return! reader.ReadToEndAsync() |> Async.AwaitTask
+    }
+
+// Функция высшего порядка для композиции middleware
+let composeMiddleware (middlewares: (HttpListenerContext -> Async<Result<unit>>) list) 
+                     (handler: HttpListenerContext -> Async<Result<string>>) 
+                     : HttpListenerContext -> Async<Result<string>> =
+    fun ctx -> 
+        async {
+            let rec processMiddlewares middlewaresList =
+                async {
+                    match middlewaresList with
+                    | [] -> 
+                        return! handler ctx
+                    | m :: rest ->
+                        let! result = m ctx
+                        match result with
+                        | Success _ -> 
+                            return! processMiddlewares rest
+                        | Error (message, code) -> 
+                            return Error (message, code)
+                }
+            return! processMiddlewares middlewares
+        }
+
+// Middleware для логирования запросов
+let loggingMiddleware : HttpListenerContext -> Async<Result<unit>> =
+    fun context ->
+        async {
+            log (sprintf "Request: %s %s" context.Request.HttpMethod (context.Request.Url.ToString()))
+            return Success ()
+        }
+
+// Middleware для проверки авторизации
+let authMiddleware (requiredRole: string option) : HttpListenerContext -> Async<Result<unit>> =
+    fun context ->
+        async {
+            try
+                let authHeader = context.Request.Headers.["Authorization"]
+                if String.IsNullOrEmpty(authHeader) then
+                    return Error ("Authorization header is missing", HttpStatusCode.Unauthorized)
+                
+                elif authHeader.StartsWith("Bearer ") then
+                    let token = authHeader.Substring(7).Trim()
+                    match sessionStore.TryGetValue token with
+                    | true, session when session.Expiry > DateTime.UtcNow ->
+                        match requiredRole with
+                        | Some role when role <> session.Role ->
+                            return Error ("Insufficient permissions", HttpStatusCode.Forbidden)
+                        | _ -> 
+                            context.Request.Headers.Add("X-User-Identity", session.Username)
+                            context.Request.Headers.Add("X-User-Role", session.Role)
+                            return Success ()
+                    | _ ->
+                        return Error ("Invalid or expired token", HttpStatusCode.Unauthorized)
+                
+                else
+                    return Error ("Unsupported authentication scheme", HttpStatusCode.Unauthorized)
+            with ex ->
+                return Error (sprintf "Authentication error: %s" ex.Message, HttpStatusCode.InternalServerError)
+        }
+
+// Middleware для проверки типа контента
+let contentTypeMiddleware (expectedTypes: string list) : HttpListenerContext -> Async<Result<unit>> =
+    fun context ->
+        async {
+            if List.isEmpty expectedTypes then 
+                return Success ()
+            else
+                let contentType = 
+                    if isNull context.Request.ContentType then ""
+                    else context.Request.ContentType.Split(';').[0].Trim()
+                
+                if List.contains contentType expectedTypes then
+                    return Success ()
+                else
+                    return Error (
+                        sprintf "Unsupported media type. Expected: %s" (String.Join(", ", expectedTypes)),
+                        HttpStatusCode.UnsupportedMediaType)
+        }
+
+// Middleware для проверки HTTP метода
+let methodMiddleware (allowedMethods: string list) : HttpListenerContext -> Async<Result<unit>> =
+    fun context ->
+        async {
+            if List.contains context.Request.HttpMethod allowedMethods then
+                return Success ()
+            else
+                return Error (
+                    sprintf "Method not allowed. Allowed: %s" (String.Join(", ", allowedMethods)),
+                    HttpStatusCode.MethodNotAllowed)
+        }
+
+// Валидация пользователя
+let validateUser (email: string) : Result<string> =
+    if email.Contains("@") then
+        Success email
+    else
+        Error ("Invalid email format", HttpStatusCode.BadRequest)
+
+// Функция высшего порядка для обработки валидации
+let validateWithLogging (handler: string -> Result<string>) : string -> Result<string> =
+    fun email ->
+        match handler email with
+        | Success validEmail ->
+            log (sprintf "Valid email: %s" validEmail)
+            Success validEmail
+        | Error (message, status) ->
+            log (sprintf "Validation error: %s" message)
+            Error (message, status)
+
+// Обработка JSON запроса
+let parseJsonRequest<'T> (body: string) =
+    try
+        let options = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+        JsonSerializer.Deserialize<'T>(body, options) |> Success
+    with :? JsonException ->
+        Error ("Invalid JSON format", HttpStatusCode.BadRequest)
+
+// Обработка form-urlencoded запроса
+let parseFormRequest (body: string) =
+    try
+        body.Split('&')
+        |> Array.choose (fun part ->
+            match part.Split('=', 2) with
+            | [| key; value |] ->
+                let decodedKey = WebUtility.UrlDecode key
+                let decodedValue = WebUtility.UrlDecode value
+                Some (decodedKey, decodedValue)
+            | _ -> None)
+        |> Map.ofArray
+        |> Success
+    with ex ->
+        Error (sprintf "Form parsing error: %s" ex.Message, HttpStatusCode.BadRequest)
+
+// Создание сессии
+let createSession (username: string) (role: string) =
+    async {
+        let token = Convert.ToBase64String(Guid.NewGuid().ToByteArray())
+        let expiry = DateTime.UtcNow.AddHours(1.0)
+        let session = { 
+            Token = token
+            Username = username
+            Role = role
+            Expiry = expiry 
+        }
+        sessionStore.TryAdd(token, session) |> ignore
+        return token
+    }
+
+// Обработчик для аутентификации
+let loginHandler (context: HttpListenerContext) : Async<Result<string>> =
+    async {
+        let! requestBody = readRequestBodyAsync context
+        
+        let credentialsResult = parseJsonRequest<{| Username: string; Password: string |}> requestBody
+        match credentialsResult with
+        | Error (message, code) -> return Error (message, code)
+        | Success credentials ->
+        
+        match userStore.TryGetValue credentials.Username with
+        | true, user ->
+            // Проверка пароля
+            let! inputHash = hashPasswordAsync credentials.Password
+            if inputHash = user.PasswordHash then
+                let! token = createSession credentials.Username user.Role
+                log (sprintf "User logged in: %s" credentials.Username)
+                return Success token
+            else
+                return Error ("Invalid credentials", HttpStatusCode.Unauthorized)
+        | false, _ ->
+            return Error ("User not found", HttpStatusCode.NotFound)
+    }
+
+// Обработчик для выхода
+let logoutHandler (context: HttpListenerContext) : Async<Result<string>> =
+    async {
+        let authHeader = context.Request.Headers.["Authorization"]
+        if String.IsNullOrEmpty(authHeader) || not (authHeader.StartsWith("Bearer ")) then
+            return Error ("Missing or invalid token", HttpStatusCode.BadRequest)
+        else
+            let token = authHeader.Substring(7).Trim()
+            match sessionStore.TryRemove token with
+            | true, session -> 
+                log (sprintf "User logged out: %s" session.Username)
+                return Success "Logged out successfully"
+            | false, _ -> 
+                return Error ("Session not found", HttpStatusCode.NotFound)
+    }
+
+// Тип для запроса добавления пользователя
+type AddUserRequest = {
+    Email: string
+    Password: string
+    Role: string option
+}
+
+// Обработчик для добавления пользователя (требует аутентификации)
+let addUserHandler (context: HttpListenerContext) : Async<Result<string>> =
+    async {
+        let contentType = 
+            if isNull context.Request.ContentType then ""
+            else context.Request.ContentType.Split(';').[0].Trim()
+        
+        if String.IsNullOrWhiteSpace contentType then
+            return Error ("Missing Content-Type", HttpStatusCode.BadRequest)
+        else
+            let! requestBody = readRequestBodyAsync context
+            
+            // Парсинг в зависимости от типа контента
+            let userRequestResult = 
+                if contentType = "application/json" then
+                    parseJsonRequest<AddUserRequest> requestBody
+                else
+                    match parseFormRequest requestBody with
+                    | Success formData ->
+                        let email = 
+                            match Map.tryFind "email" formData with
+                            | Some e -> e
+                            | None -> ""
+                            
+                        let password = 
+                            match Map.tryFind "password" formData with
+                            | Some p -> p
+                            | None -> ""
+                            
+                        let role = 
+                            Map.tryFind "role" formData
+                            
+                        Success { Email = email; Password = password; Role = role }
+                    | Error (message, code) -> Error (message, code)
+                
+            match userRequestResult with
+            | Error (message, code) -> return Error (message, code)
+            | Success userRequest ->
+            
+            // Валидация email
+            match validateWithLogging validateUser userRequest.Email with
+            | Error (message, code) -> return Error (message, code)
+            | Success email ->
+            
+            // Проверка пароля
+            if String.IsNullOrWhiteSpace userRequest.Password then
+                return Error ("Password is required", HttpStatusCode.BadRequest)
+            else
+                // Проверка прав (только администраторы могут добавлять пользователей)
+                let username = context.Request.Headers.["X-User-Identity"]
+                match userStore.TryGetValue username with
+                | true, { Role = "Administrator" } ->
+                    // Хеширование пароля и добавление пользователя
+                    let! passwordHash = hashPasswordAsync userRequest.Password
+                    let role = userRequest.Role |> Option.defaultValue "User"
+                    
+                    let user = { 
+                        Email = email
+                        PasswordHash = passwordHash
+                        Role = role
+                    }
+                    
+                    if userStore.TryAdd(email, user) then
+                        log (sprintf "User added: %s by %s" email username)
+                        return Success (sprintf "User %s added." email)
+                    else
+                        return Success (sprintf "User %s already exists" email)
+                | _ ->
+                    return Error ("Insufficient permissions", HttpStatusCode.Forbidden)
+    }
+
+// Обработчик для несуществующего маршрута
+let notFoundHandler : HttpListenerContext -> Async<Result<string>> =
+    fun _ -> async { return Error ("404 Not Found", HttpStatusCode.NotFound) }
+
+// Функция для маршрутизации
+let route (context: HttpListenerContext) : Async<Result<string>> =
+    match context.Request.Url.AbsolutePath with
+    | "/login" -> 
+        composeMiddleware
+            [ 
+                methodMiddleware ["POST"]
+                contentTypeMiddleware ["application/json"] 
+            ]
+            loginHandler context
+    
+    | "/logout" -> 
+        composeMiddleware
+            [ 
+                methodMiddleware ["POST"]
+                authMiddleware None
+            ]
+            logoutHandler context
+    
+    | "/adduser" -> 
+        composeMiddleware
+            [ 
+                methodMiddleware ["POST"]
+                contentTypeMiddleware ["application/json"; "application/x-www-form-urlencoded"]
+                authMiddleware (Some "Administrator") 
+            ]
+            addUserHandler context
+    
+    | _ -> notFoundHandler context
+
+// Функция высшего порядка для отправки ответа
+let sendResponse (context: HttpListenerContext) (response: Result<string>) =
+    let responseString, statusCode =
+        match response with
+        | Success message -> message, HttpStatusCode.OK
+        | Error (message, status) -> message, status
+    
+    log (sprintf "Response: %d - %s" (int statusCode) responseString)
+    
+    let buffer = Encoding.UTF8.GetBytes(responseString)
+    context.Response.StatusCode <- int statusCode
+    context.Response.ContentLength64 <- int64 buffer.Length
+    context.Response.OutputStream.Write(buffer, 0, buffer.Length)
+    context.Response.OutputStream.Close()
+
+// Основной обработчик
+let handleRequest (context: HttpListenerContext) =
+    async {
+        let! response = 
+            composeMiddleware
+                [ loggingMiddleware ]
+                route context
+        
+        sendResponse context response
+    }
+
+// Запуск HTTP-сервера
+[<EntryPoint>]
+let main _ =
+    let listener = new HttpListener()
+    listener.Prefixes.Add("http://localhost:8080/")
+    listener.Start()
+    log "Server started. Listening on http://localhost:8080/"
+
+    let rec listen() =
+        async {
+            let! context = listener.GetContextAsync() |> Async.AwaitTask
+            do! handleRequest context
+            return! listen()
+        }
+
+    Async.Start (async {
+        while true do
+            do! Async.Sleep(TimeSpan.FromMinutes(1.0))
+            // Очистка просроченных сессий
+            let now = DateTime.UtcNow
+            let expiredTokens = 
+                sessionStore.Keys 
+                |> Seq.filter (fun k -> 
+                    match sessionStore.TryGetValue k with
+                    | true, session -> session.Expiry <= now
+                    | false, _ -> false)
+                |> Seq.toList
+                
+            expiredTokens |> List.iter (fun t -> sessionStore.TryRemove t |> ignore)
+            log (sprintf "Cleaned up %d expired sessions" expiredTokens.Length)
+    })
+
+    listen() |> Async.Start
+    Console.ReadLine() |> ignore
+    0
