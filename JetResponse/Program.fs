@@ -162,7 +162,7 @@ type Logger() =
                          | Info -> "INF"
                          | Warning -> "WRN"
                          | Error -> "ERR"
-            printf $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{prefix}] {msg}"
+            printfn "[%s] %s" (DateTime.Now.ToString("o")) msg
             return! loop()
         }
         loop())
@@ -196,16 +196,16 @@ type CacheService() =
             cache.Clear()
         )
 
-// Сервис аутентификации
+// Исправленный AuthService
 type AuthService(logger: Logger) =
     let validTokens = ["token1"; "token2"; "admin"]
     
     member this.Authenticate(token: string) : bool =
         if validTokens |> List.contains token then
-            logger.Debug($"Authenticated token: {token}")
+            logger.Debug(sprintf "Authenticated token: %s" token)
             true
         else
-            logger.Warning($"Invalid token: {token}")
+            logger.Warning(sprintf "Invalid token: %s" token)
             false
 
 // Контейнер сервисов
@@ -312,32 +312,25 @@ let writeResponse (ctx: RequestContext) (result: Result<string>) =
     }
 
 // Middleware
-let loggingMiddleware : Middleware =
+
+let authMiddleware : Middleware =
     fun next ->
         ReaderT.reader {
             let! ctx = ReaderT.ask
             let request = ctx.Request
             let path = request.Url.AbsolutePath
             
-            ctx.Services.Logger.Info(
-                $"Request started: {request.HttpMethod} {path}\n" +
-                $"Headers: {request.Headers}"
-            )
-            
-            try
-                let! result = next
-                ctx.Services.Logger.Info(
-                    $"Request completed: {request.HttpMethod} {path}\n" +
-                    $"Status: {ctx.Response.StatusCode}"
-                )
-                return result
-            with ex ->
-                ctx.Services.Logger.Error(
-                    $"Request failed: {request.HttpMethod} {path}\n" +
-                    $"Error: {ex.Message}\n" +
-                    $"Stack: {ex.StackTrace}"
-                )
-                return! ReaderT.liftResult (Failure (Errors.internalError ex.Message path))
+            // Пропускаем аутентификацию для публичных путей
+            if path = "/public" then 
+                return! next
+            else
+                let token = request.Headers.["Authorization"]
+                if String.IsNullOrEmpty(token) then
+                    return! ReaderT.liftResult (Failure (Errors.unauthorized path))
+                elif ctx.Services.Auth.Authenticate(token) then
+                    return! next
+                else
+                    return! ReaderT.liftResult (Failure (Errors.unauthorized path))
         }
 
 let methodCheckMiddleware (allowedMethods: string list) : Middleware =
@@ -353,43 +346,61 @@ let methodCheckMiddleware (allowedMethods: string list) : Middleware =
                 return! ReaderT.liftResult (Failure Errors.methodNotAllowed)
         }
 
-let authMiddleware : Middleware =
+        // Исправленный middleware для логирования
+let loggingMiddleware : Middleware =
     fun next ->
         ReaderT.reader {
             let! ctx = ReaderT.ask
             let request = ctx.Request
             let path = request.Url.AbsolutePath
             
-            // Пропускаем аутентификацию для публичных путей
-            if path = "/public" then 
-                return! next
+            // Исправленные вызовы логгера
+            ctx.Services.Logger.Info(
+                sprintf "Request started: %s %s\nHeaders: %O" 
+                    request.HttpMethod 
+                    path 
+                    request.Headers
+            )
             
-            let token = request.Headers.["Authorization"]
-            if String.IsNullOrEmpty(token) then
-                return! ReaderT.liftResult (Failure (Errors.unauthorized path))
-            elif ctx.Services.Auth.Authenticate(token) then
-                return! next
-            else
-                return! ReaderT.liftResult (Failure (Errors.unauthorized path))
+            try
+                let! result = next
+                ctx.Services.Logger.Info(
+                    sprintf "Request completed: %s %s\nStatus: %d" 
+                        request.HttpMethod 
+                        path 
+                        ctx.Response.StatusCode
+                )
+                return result
+            with ex ->
+                ctx.Services.Logger.Error(
+                    sprintf "Request failed: %s %s\nError: %s\nStack: %s" 
+                        request.HttpMethod 
+                        path 
+                        ex.Message 
+                        ex.StackTrace
+                )
+                return! ReaderT.liftResult (Failure (Errors.internalError ex.Message path))
         }
 
+// Исправленный cachingMiddleware
 let cachingMiddleware (duration: TimeSpan) : Middleware =
     fun next ->
         ReaderT.reader {
             let! ctx = ReaderT.ask
             let request = ctx.Request
-            let cacheKey = $"{request.HttpMethod}:{request.Url}"
+            let cacheKey = sprintf "%s:%O" request.HttpMethod request.Url
             
             match ctx.Services.Cache.Get<string>(cacheKey) with
             | Some cachedResponse -> 
-                ctx.Services.Logger.Debug($"Cache hit for {cacheKey}")
+                ctx.Services.Logger.Debug(sprintf "Cache hit for %s" cacheKey)
                 return cachedResponse
             | None ->
                 let! result = next
+                ctx.Services.Logger.Debug(sprintf "Cached response for %s" cacheKey)
                 ctx.Services.Cache.Set(cacheKey, result)
-                ctx.Services.Logger.Debug($"Cached response for {cacheKey}")
                 return result
         }
+
 
 // Парсинг параметров запроса
 module RequestParser =
@@ -400,8 +411,13 @@ module RequestParser =
         |> Map.ofSeq
     
     let parseBody<'T> (request: HttpListenerRequest) = async {
-        use reader = new StreamReader(request.InputStream, request.ContentEncoding)
+        // Исправлено: сохраняем исходную кодировку
+        let encoding = request.ContentEncoding
+        use reader = new StreamReader(request.InputStream, encoding)
         let! body = reader.ReadToEndAsync() |> Async.AwaitTask
+        
+        // Важно: сбрасываем позицию потока для повторного чтения
+        request.InputStream.Position <- 0L
         return JsonSerializer.Deserialize<'T>(body, jsonSerializerOptions)
     }
 
@@ -466,6 +482,9 @@ let composeMiddleware (middlewares: Middleware list) (handler: RouteHandler) =
 
 // Инициализация DI
 let createServiceProvider () =
+    // Временный провайдер для создания сервисов
+    let tempProvider = ServiceProvider([])
+    
     let services = [
         // Singleton services
         { 
@@ -488,7 +507,8 @@ let createServiceProvider () =
         { 
             ServiceType = typeof<AuthService>
             ImplementationFactory = fun () -> 
-                let logger = ServiceProvider.GetService<Logger>()
+                // Исправлено: используем временный провайдер
+                let logger = tempProvider.GetService<Logger>()
                 AuthService(logger) :> obj
             Lifetime = Scoped 
         }
