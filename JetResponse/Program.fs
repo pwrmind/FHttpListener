@@ -2,26 +2,27 @@
 open System.Text
 open System
 
-// Определяем типы для успешного и неуспешного результата
+// Тип для описания ошибок с HTTP-статусом
+type HttpError = { Message: string; StatusCode: int }
+
+// Результат с явным разделением успеха/ошибки
 type Result<'T> =
     | Success of 'T
-    | Failure of string
+    | Failure of HttpError
 
-// Определяем тип для обработки HTTP-запросов
+// Типы для обработчиков и middleware
 type HttpRequestHandler = HttpListenerRequest -> Async<Result<string>>
-
-// Определяем тип для middleware
 type Middleware = HttpRequestHandler -> HttpRequestHandler
 
-// Определяем тип для маршрута
-type Route = string * string * HttpRequestHandler // (HTTP метод, путь, обработчик)
+// Тип для маршрута (Метод, Путь, Обработчик)
+type Route = string * string * HttpRequestHandler
 
-// Асинхронный логгер с буферизацией
+// Логгер с обработкой сообщений в отдельном потоке
 type Logger() =
     let agent = MailboxProcessor.Start(fun inbox ->
         let rec loop () = async {
             let! (msg: string) = inbox.Receive()
-            do! Async.SwitchToNewThread()  // Выполняем I/O в отдельном потоке
+            do! Async.SwitchToNewThread()
             printfn "[%s] %s" (DateTime.Now.ToString("o")) msg
             return! loop()
         }
@@ -29,34 +30,52 @@ type Logger() =
 
     member __.Log(message) = agent.Post(message)
 
-// Глобальный экземпляр логгера
+// Глобальный логгер (в реальном приложении лучше инжектировать)
 let logger = Logger()
 
-// Функция для обработки успешного результата
-let handleSuccess (response: HttpListenerResponse) (result: Result<string>) =
-    match result with
-    | Success content ->
-        response.StatusCode <- 200
-        let buffer = Encoding.UTF8.GetBytes(content)
-        response.ContentLength64 <- int64 buffer.Length
-        response.OutputStream.Write(buffer, 0, buffer.Length)
-    | Failure errorMessage ->
-        response.StatusCode <- 400
-        let buffer = Encoding.UTF8.GetBytes(errorMessage)
-        response.ContentLength64 <- int64 buffer.Length
-        response.OutputStream.Write(buffer, 0, buffer.Length)
+// Стандартные ошибки
+module Errors =
+    let notFound = { Message = "Route not found"; StatusCode = 404 }
+    let methodNotAllowed = { Message = "Method not allowed"; StatusCode = 405 }
+    let badRequest msg = { Message = msg; StatusCode = 400 }
 
-// Пример middleware для логирования
+// Асинхронная запись ответа
+let writeResponse (response: HttpListenerResponse) = function
+    | Success (content: string) ->
+        async {
+            response.StatusCode <- 200
+            let buffer = Encoding.UTF8.GetBytes(content)
+            response.ContentLength64 <- int64 buffer.Length
+            do! response.OutputStream.WriteAsync(buffer, 0, buffer.Length) |> Async.AwaitTask
+            do! response.OutputStream.FlushAsync() |> Async.AwaitTask
+        }
+    | Failure (error: HttpError) ->
+        async {
+            response.StatusCode <- error.StatusCode
+            let buffer = Encoding.UTF8.GetBytes(error.Message)
+            response.ContentLength64 <- int64 buffer.Length
+            do! response.OutputStream.WriteAsync(buffer, 0, buffer.Length) |> Async.AwaitTask
+            do! response.OutputStream.FlushAsync() |> Async.AwaitTask
+        }
+
+
+// Middleware для логирования (теперь обрабатывает и результат)
 let loggingMiddleware: Middleware =
     fun next ->
         fun request ->
             async {
-                //logger.Log(sprintf "Received request: %s %s" request.HttpMethod (request.Url.ToString()))
+                logger.Log(sprintf "Request started: %s %s" request.HttpMethod request.Url.AbsolutePath)
+                
                 let! result = next request
+                
+                match result with
+                | Success _ -> logger.Log "Request completed successfully"
+                | Failure e -> logger.Log(sprintf "Request failed: %s (Status: %d)" e.Message e.StatusCode)
+                
                 return result
             }
 
-// Пример middleware для проверки метода
+// Middleware для проверки метода
 let methodCheckMiddleware: Middleware =
     fun next ->
         fun request ->
@@ -64,66 +83,84 @@ let methodCheckMiddleware: Middleware =
                 if request.HttpMethod = "GET" || request.HttpMethod = "POST" then
                     return! next request
                 else
-                    return Failure "Unsupported HTTP method"
+                    return Failure Errors.methodNotAllowed
             }
 
-// Пример функции обработки запроса для маршрута "/hello"
+// Middleware для обработки 404 ошибок
+let notFoundMiddleware: Middleware =
+    fun next ->
+        fun request ->
+            async {
+                match! next request with
+                | Failure e when e.StatusCode = 404 -> 
+                    return Failure { e with Message = $"Path not found: {request.Url.AbsolutePath}" }
+                | result -> return result
+            }
+
+// Обработчики маршрутов
 let helloHandler: HttpRequestHandler =
     fun request ->
         async {
             return Success "Hello, World!"
         }
 
-// Пример функции обработки запроса для маршрута "/goodbye"
 let goodbyeHandler: HttpRequestHandler =
     fun request ->
         async {
             return Success "Goodbye, World!"
         }
 
-// Функция для маршрутизации
+// Маршрутизатор
 let routeRequest (routes: Route list) (request: HttpListenerRequest): Async<Result<string>> =
     let method = request.HttpMethod
     let path = request.Url.AbsolutePath
-    let matchingRoute = routes |> List.tryFind (fun (m, p, _) -> m = method && p = path)
-    match matchingRoute with
+    match routes |> List.tryFind (fun (m, p, _) -> m = method && p = path) with
     | Some (_, _, handler) -> handler request
-    | None -> async { return Failure "Route not found." }
+    | None -> async { return Failure Errors.notFound }
 
-// Функция для компоновки нескольких middleware
+// Композиция middleware
 let composeMiddleware (middlewares: Middleware list) (handler: HttpRequestHandler): HttpRequestHandler =
     List.foldBack (fun middleware acc -> middleware acc) middlewares handler
 
-// Основная функция для запуска сервера
+// Запуск сервера
 let startServer (prefix: string) =
     let listener = new HttpListener()
     listener.Prefixes.Add(prefix)
     listener.Start()
     printfn "Listening on %s" prefix
 
-    // Определяем маршруты
-    let routes: Route list = [
-        ("GET", "/hello", helloHandler)
-        ("GET", "/goodbye", goodbyeHandler)
+    // Функции-помощники для маршрутов
+    let get path handler = ("GET", path, handler)
+    let post path handler = ("POST", path, handler)
+
+    // Функция для добавления middleware
+    let withMiddleware middleware handler = middleware handler
+
+    // Определение маршрутов
+    let routes = [
+        get "/hello" (fun _ -> async { return Success "Hello, World!" })
+        post "/goodbye" goodbyeHandler
     ]
 
-    // Компонуем обработчики с middleware
+    // Построение обработчика с middleware
     let composedHandler =
-        composeMiddleware [loggingMiddleware; methodCheckMiddleware] (routeRequest routes)
+        routeRequest routes
+        |> withMiddleware loggingMiddleware
+        |> withMiddleware methodCheckMiddleware
+        |> withMiddleware notFoundMiddleware
 
     let rec handleRequest() =
         async {
             let! context = listener.GetContextAsync() |> Async.AwaitTask
             let response = context.Response
             let! result = composedHandler context.Request
-            handleSuccess response result
+            do! writeResponse response result
             response.Close()
             return! handleRequest()
         }
 
     Async.Start(handleRequest())
 
-// Запуск сервера
 [<EntryPoint>]
 let main argv =
     startServer "http://localhost:8080/"
