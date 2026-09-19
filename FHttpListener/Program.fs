@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────
-// ADR × VERTICAL SLICING — F# STARTER (single file, zero NuGet)
+// ADR × VERTICAL SLICING — F# STARTER (single file, one NuGet)
 // ─────────────────────────────────────────────────────────────────────
 //
 // Идея. Весь конвейер ADR выражается одним type alias:
@@ -10,9 +10,15 @@
 // Срез — данные: record Slice { Name; Routes: Map<string, Handler> }.
 // Kernel — match по route, без рефлексии, без атрибутов.
 //
+// ── ЗАВИСИМОСТИ ───────────────────────────────────────────────────
+//   dotnet add package Microsoft.Data.Sqlite
+//   Всё остальное — BCL. System.Text.Json встроен.
+//
 // ── ИНВАРИАНТЫ ────────────────────────────────────────────────────
 //   Domain    : Request -> Context -> Async<Result<Outcome, DomainError>>
-//               только логика + БД, не знает про HTML/JSON.
+//               только логика + SQL, не знает про HTML/JSON.
+//               ОДИН срез = ОДИН запрос (или два, но не N+1).
+//               Каждый запрос — параметризован, поля перечислены явно.
 //   Responder : Result<Outcome, DomainError> -> Request -> Response
 //               только форматирование, не знает про БД.
 //   action    : Domain ∘ Responder → Handler.
@@ -25,17 +31,18 @@
 //   3. Добавь срез в список `slices` внизу.
 //
 // ── ЗАПУСК ────────────────────────────────────────────────────────
-//   dotnet fsi starter.fsx                 → сервер на :8080
-//   RUN_CI=1 dotnet fsi starter.fsx        → тесты
-//   dotnet fsi starter.fsx -- --run-ci     → тесты (альтернатива)
+//   dotnet run                     → сервер на :8080
+//   RUN_CI=1 dotnet run            → тесты
+//   dotnet run -- --run-ci         → тесты (альтернатива)
 // ─────────────────────────────────────────────────────────────────────
 
 open System
+open System.Globalization
 open System.IO
 open System.Net
 open System.Text
 open System.Text.Json
-open System.Collections.Concurrent
+open Microsoft.Data.Sqlite
 
 // ═════════════════════════════════════════════════════════════════════
 // 1. ДАННЫЕ — records без поведения
@@ -69,13 +76,14 @@ type AuthState = {
     CsrfToken: string
 }
 
-// Доменные данные — конкретны для фичи, но живут в общем Store.
+// Доменный тип — конкретен для среза, но объявлен здесь как данные.
 type Item = { Id: string; Title: string; CreatedAt: DateTime }
 
-type Store = { Items: ConcurrentDictionary<string, Item> }
-
+// Context — единственная точка DI. Db — открытое соединение,
+// живёт всё время работы приложения (для SQLite это правильно:
+// файл-хэндл один, SQLite сам сериализует записи).
 type Context = {
-    Store:  Store
+    Db:     SqliteConnection
     Config: Map<string, string>
     Auth:   AuthState
     Log:    string -> unit
@@ -108,7 +116,7 @@ let errorMessage = function
 // ═════════════════════════════════════════════════════════════════════
 
 type Outcome =
-    | Show     of obj          // данные для view (типизированы по конвенции)
+    | Show     of obj
     | Redirect of string
 
 type Handler    = Request -> Context -> Async<Result<Response, DomainError>>
@@ -122,7 +130,7 @@ let action (domain: Domain) (responder: Responder) : Handler =
         return Ok (responder result req)
     }
 
-// ─── Result CE для Async<Result<_,_>> — заменяет цепочки match! ───
+// CE result { } для Async<Result<_,_>> — для случаев с цепочками.
 type AsyncResultBuilder() =
     member _.Bind(m: Async<Result<'a,'e>>, f: 'a -> Async<Result<'b,'e>>) =
         async {
@@ -137,7 +145,48 @@ type AsyncResultBuilder() =
 let result = AsyncResultBuilder()
 
 // ═════════════════════════════════════════════════════════════════════
-// 4. VIEWS — обычные функции, никаких .phtml
+// 4. DB — тонкая обёртка над Microsoft.Data.Sqlite
+// ═════════════════════════════════════════════════════════════════════
+
+module Db =
+    /// Открыть соединение и применить миграции.
+    let openAndMigrate (path: string) : SqliteConnection =
+        let conn = new SqliteConnection($"Data Source={path}")
+        conn.Open()
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- """
+            PRAGMA journal_mode = WAL;
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE IF NOT EXISTS items (
+                id         TEXT PRIMARY KEY,
+                title      TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_items_created_at
+                ON items(created_at DESC);
+        """
+        cmd.ExecuteNonQuery() |> ignore
+        conn
+
+    /// In-memory соединение с применёнными миграциями — для тестов.
+    let inMemory () : SqliteConnection =
+        let conn = new SqliteConnection("Data Source=:memory:")
+        conn.Open()
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- """
+            CREATE TABLE items (
+                id         TEXT PRIMARY KEY,
+                title      TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_items_created_at ON items(created_at DESC);
+        """
+        cmd.ExecuteNonQuery() |> ignore
+        conn
+
+// ═════════════════════════════════════════════════════════════════════
+// 5. VIEWS — обычные функции, никаких .phtml
 // ═════════════════════════════════════════════════════════════════════
 
 module Views =
@@ -173,7 +222,6 @@ module Views =
     let error (title: string) (message: string) =
         $"<h1>{esc title}</h1><p>{esc message}</p><p><a href=\"?action=items\">← назад</a></p>"
 
-    // Типизированная view: получает obj и приводит к конкретному record'у.
     type ItemsView = { Items: Item list }
 
     let items (data: obj) : string =
@@ -201,7 +249,7 @@ module Views =
 {rows}"""
 
 // ═════════════════════════════════════════════════════════════════════
-// 5. RESPONSES + RESPONDERS — curried, переиспользуемые
+// 6. RESPONSES + RESPONDERS
 // ═════════════════════════════════════════════════════════════════════
 
 let htmlHeaders = Map [ "Content-Type", "text/html; charset=utf-8" ]
@@ -213,6 +261,12 @@ let htmlBody (status: int) (body: string) : Response =
 let jsonBody (status: int) (body: string) : Response =
     { Status = status; Headers = jsonHeaders; Body = body }
 
+let private jsonOptions =
+    JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase)
+
+let private serialize (value: obj) : string =
+    JsonSerializer.Serialize(value, value.GetType(), jsonOptions)
+
 let htmlResponder (view: obj -> string) (title: string) : Responder =
     fun result _req ->
         match result with
@@ -223,12 +277,6 @@ let htmlResponder (view: obj -> string) (title: string) : Responder =
         | Error e ->
             let s = httpStatus e
             htmlBody s (Views.layout (string s) (Views.error (string s) (errorMessage e)))
-
-let private jsonOptions =
-    JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase)
-
-let private serialize (value: obj) : string =
-    JsonSerializer.Serialize(value, value.GetType(), jsonOptions)
 
 let jsonResponder : Responder =
     fun result _req ->
@@ -248,7 +296,7 @@ let negotiatingResponder (html: Responder) (json: Responder) : Responder =
         else html result req
 
 // ═════════════════════════════════════════════════════════════════════
-// 6. MIDDLEWARE — Handler -> Handler
+// 7. MIDDLEWARE — Handler -> Handler
 // ═════════════════════════════════════════════════════════════════════
 
 let withCsrf : Middleware =
@@ -271,47 +319,64 @@ let withAuth : Middleware =
     }
 
 // ═════════════════════════════════════════════════════════════════════
-// 7. FEATURE — единственный эталонный срез
+// 8. FEATURE — единственный эталонный срез (SQL-паттерн)
 // ═════════════════════════════════════════════════════════════════════
-
-// ─── Domain: использует CE result { } для цепочек ───
 
 let itemsList : Domain =
     fun _req ctx ->
-        result {
+        async {
+            // Один запрос. Явные поля. Сортировка в БД, не в памяти.
+            use cmd = ctx.Db.CreateCommand()
+            cmd.CommandText <-
+                "SELECT id, title, created_at FROM items ORDER BY created_at DESC"
+            use reader = cmd.ExecuteReader()
             let items =
-                ctx.Store.Items.Values
-                |> Seq.sortByDescending (fun i -> i.CreatedAt)
-                |> Seq.toList
-            return Show (box { Views.ItemsView.Items = items })
+                [ while reader.Read() do
+                    yield {
+                        Id        = reader.GetString 0
+                        Title     = reader.GetString 1
+                        CreatedAt = DateTime.Parse(
+                                        reader.GetString 2,
+                                        CultureInfo.InvariantCulture,
+                                        DateTimeStyles.RoundtripKind)
+                    } ]
+            return Ok (Show (box { Views.ItemsView.Items = items }))
         }
 
 let itemsCreate : Domain =
     fun req ctx ->
-        result {
+        async {
             let title = (req.Body.TryFind "title" |> Option.defaultValue "").Trim()
             if title.Length < 2 then
-                return! async { return Error (Validation "Название минимум 2 символа.") }
+                return Error (Validation "Название минимум 2 символа.")
             else
                 let id = "i_" + Guid.NewGuid().ToString("N").Substring(0, 8)
-                ctx.Store.Items.[id] <- { Id = id; Title = title; CreatedAt = DateTime.UtcNow }
+                // Параметризованный INSERT. Никакой конкатенации строк.
+                use cmd = ctx.Db.CreateCommand()
+                cmd.CommandText <-
+                    "INSERT INTO items (id, title, created_at) VALUES (@id, @title, @now)"
+                cmd.Parameters.AddWithValue("@id",    id) |> ignore
+                cmd.Parameters.AddWithValue("@title", title) |> ignore
+                cmd.Parameters.AddWithValue("@now",   DateTime.UtcNow.ToString("o")) |> ignore
+                cmd.ExecuteNonQuery() |> ignore
                 ctx.Log $"created item {id}"
-                return Redirect "?action=items"
+                return Ok (Redirect "?action=items")
         }
 
 let itemsDelete : Domain =
     fun req ctx ->
-        result {
+        async {
             match req.Body.TryFind "id" with
             | None | Some "" ->
-                return! async { return Error (Validation "Не указан id.") }
+                return Error (Validation "Не указан id.")
             | Some id ->
-                ctx.Store.Items.TryRemove id |> ignore
+                use cmd = ctx.Db.CreateCommand()
+                cmd.CommandText <- "DELETE FROM items WHERE id = @id"
+                cmd.Parameters.AddWithValue("@id", id) |> ignore
+                cmd.ExecuteNonQuery() |> ignore
                 ctx.Log $"deleted item {id}"
-                return Redirect "?action=items"
+                return Ok (Redirect "?action=items")
         }
-
-// ─── Slice: данные ───
 
 type Slice = { Name: string; Routes: Map<string, Handler> }
 
@@ -330,12 +395,15 @@ let itemsSlice : Slice =
       ] }
 
 // ═════════════════════════════════════════════════════════════════════
-// 8. KERNEL — 15 строк, без рефлексии
+// 9. KERNEL — 15 строк, без рефлексии
 // ═════════════════════════════════════════════════════════════════════
 
 let renderError (wantsJson: bool) (e: DomainError) : Response =
-    if wantsJson then jsonBody (httpStatus e) ("{\"error\":\"" + errorMessage e + "\"}")
-    else htmlBody (httpStatus e) (Views.layout (string (httpStatus e))
+    if wantsJson then
+        let msg = JsonSerializer.Serialize(errorMessage e)
+        jsonBody (httpStatus e) ("{\"error\":" + msg + "}")
+    else
+        htmlBody (httpStatus e) (Views.layout (string (httpStatus e))
                                        (Views.error (string (httpStatus e)) (errorMessage e)))
 
 let dispatch (slices: Slice list) (req: Request) (ctx: Context) : Async<Response> =
@@ -345,11 +413,11 @@ let dispatch (slices: Slice list) (req: Request) (ctx: Context) : Async<Response
             ctx.Log $"→ {req.Method} {req.Route}"
             let! result =
                 match slices |> List.tryFind (fun s -> s.Name = req.Route) with
-                | None          -> async { return Error NotFound }
+                | None -> async { return Error NotFound }
                 | Some slice ->
                     match slice.Routes.TryFind (routeKey req) with
-                    | None           -> async { return Error MethodNotAllowed }
-                    | Some handler   -> handler req ctx
+                    | None         -> async { return Error MethodNotAllowed }
+                    | Some handler -> handler req ctx
             match result with
             | Ok resp ->
                 ctx.Log $"← {resp.Status}"
@@ -363,7 +431,7 @@ let dispatch (slices: Slice list) (req: Request) (ctx: Context) : Async<Response
     }
 
 // ═════════════════════════════════════════════════════════════════════
-// 9. HTTP BRIDGE — HttpListener ⇄ Request/Response
+// 10. HTTP BRIDGE — HttpListener ⇄ Request/Response
 // ═════════════════════════════════════════════════════════════════════
 
 let parseForm (s: string) : Map<string, string> =
@@ -395,7 +463,8 @@ let requestOf (ctx: HttpListenerContext) : Async<Request> =
             Params  = queryParams
             Body    = body
             Headers = Map [ "x-csrf-token",
-                            ctx.Request.Headers.["X-Csrf-Token"] |> Option.ofObj |> Option.defaultValue "" ]
+                            ctx.Request.Headers.["X-Csrf-Token"]
+                            |> Option.ofObj |> Option.defaultValue "" ]
         }
     }
 
@@ -416,7 +485,7 @@ let emit (resp: Response) (ctx: HttpListenerContext) : Async<unit> =
     }
 
 // ═════════════════════════════════════════════════════════════════════
-// 10. ХРАНИЛИЩЕ + ЛОГГЕР (MailboxProcessor — как в твоём коде)
+// 11. ХРАНИЛИЩЕ + ЛОГГЕР (MailboxProcessor)
 // ═════════════════════════════════════════════════════════════════════
 
 type Logger() =
@@ -430,22 +499,25 @@ type Logger() =
     member _.Log(msg) = agent.Post msg
 
 let globalLogger = Logger()
-let globalStore  = { Items = ConcurrentDictionary<string, Item>() }
+
+// Одно соединение на приложение. SQLite сам сериализует записи.
+// Для Postgres здесь был бы пул — Context хранил бы DataSource.
+let globalDb = Db.openAndMigrate "app.db"
 
 let contextOf (req: Request) : Context =
-    { Store  = globalStore
+    { Db     = globalDb
       Config = Map.empty
       Auth   = authOf req
       Log    = globalLogger.Log }
 
 // ═════════════════════════════════════════════════════════════════════
-// 11. ТЕСТЫ — функции, не методы
+// 12. ТЕСТЫ — свежее in-memory соединение на каждый тест
 // ═════════════════════════════════════════════════════════════════════
 
 let private fail msg = raise (Exception msg)
 
-let testContext () : Context =
-    { Store  = { Items = ConcurrentDictionary() }
+let freshContext () : Context =
+    { Db     = Db.inMemory ()
       Config = Map.empty
       Auth   = { UserId = Some "u1"; CsrfToken = "test-token" }
       Log    = ignore }
@@ -457,31 +529,33 @@ let testReq method' route body : Request =
 let tests : (string * (unit -> Async<unit>)) list = [
 
     "items/empty_list", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! r = dispatch [itemsSlice] (testReq "GET" "items" Map.empty) ctx
         if r.Status <> 200 then fail $"expected 200, got {r.Status}"
         if not (r.Body.Contains "Пока ничего нет") then fail "empty state not shown"
     }
 
     "items/create_validation", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! r = dispatch [itemsSlice] (testReq "POST" "items"
                     (Map [ "op", "create"; "title", "x"; "csrf_token", "test-token" ])) ctx
         if r.Status <> 422 then fail $"expected 422, got {r.Status}"
-        if ctx.Store.Items.Count <> 0 then fail "should not insert on validation error"
+        use cmd = ctx.Db.CreateCommand()
+        cmd.CommandText <- "SELECT COUNT(*) FROM items"
+        let n = Convert.ToInt32(cmd.ExecuteScalar())
+        if n <> 0 then fail "should not insert on validation error"
     }
 
     "items/create_then_list", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! _ = dispatch [itemsSlice] (testReq "POST" "items"
                     (Map [ "op", "create"; "title", "Hello"; "csrf_token", "test-token" ])) ctx
-        if ctx.Store.Items.Count <> 1 then fail "row not inserted"
         let! r = dispatch [itemsSlice] (testReq "GET" "items" Map.empty) ctx
         if not (r.Body.Contains "Hello") then fail "created item not visible"
     }
 
     "items/redirect_after_create", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! r = dispatch [itemsSlice] (testReq "POST" "items"
                     (Map [ "op", "create"; "title", "A"; "csrf_token", "test-token" ])) ctx
         if r.Status <> 302 then fail $"expected 302, got {r.Status}"
@@ -489,42 +563,51 @@ let tests : (string * (unit -> Async<unit>)) list = [
     }
 
     "items/csrf_rejects_bad_token", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! r = dispatch [itemsSlice] (testReq "POST" "items"
                     (Map [ "op", "create"; "title", "X"; "csrf_token", "WRONG" ])) ctx
         if r.Status <> 403 then fail $"expected 403, got {r.Status}"
-        if ctx.Store.Items.Count <> 0 then fail "should not insert on CSRF failure"
+        use cmd = ctx.Db.CreateCommand()
+        cmd.CommandText <- "SELECT COUNT(*) FROM items"
+        let n = Convert.ToInt32(cmd.ExecuteScalar())
+        if n <> 0 then fail "should not insert on CSRF failure"
     }
 
     "items/json_negotiation", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! _ = dispatch [itemsSlice] (testReq "POST" "items"
                     (Map [ "op", "create"; "title", "Json"; "csrf_token", "test-token" ])) ctx
-        let req = { testReq "GET" "items" Map.empty with Params = Map [ "format", "json" ] }
+        let req = { testReq "GET" "items" Map.empty with
+                        Params = Map [ "format", "json" ] }
         let! r = dispatch [itemsSlice] req ctx
         if not (r.Headers.["Content-Type"].Contains "json") then fail "expected JSON"
-        if not (r.Body.Contains "\"Json\"") then fail "JSON payload missing"
+        if r.Body.Contains "null" then fail $"JSON has nulls: {r.Body}"
+        if not (r.Body.Contains "\"title\":\"Json\"") then fail $"title missing: {r.Body}"
     }
 
     "items/delete", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! _ = dispatch [itemsSlice] (testReq "POST" "items"
                     (Map [ "op", "create"; "title", "Del"; "csrf_token", "test-token" ])) ctx
-        let id = ctx.Store.Items |> Seq.head |> fun kv -> kv.Key
+        use get = ctx.Db.CreateCommand()
+        get.CommandText <- "SELECT id FROM items LIMIT 1"
+        let id = get.ExecuteScalar() :?> string
         let! r = dispatch [itemsSlice] (testReq "POST" "items"
                     (Map [ "op", "delete"; "id", id; "csrf_token", "test-token" ])) ctx
         if r.Status <> 302 then fail $"expected 302, got {r.Status}"
-        if ctx.Store.Items.Count <> 0 then fail "row not deleted"
+        use cnt = ctx.Db.CreateCommand()
+        cnt.CommandText <- "SELECT COUNT(*) FROM items"
+        if Convert.ToInt32(cnt.ExecuteScalar()) <> 0 then fail "row not deleted"
     }
 
     "kernel/not_found", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! r = dispatch [itemsSlice] (testReq "GET" "unknown" Map.empty) ctx
         if r.Status <> 404 then fail $"expected 404, got {r.Status}"
     }
 
     "kernel/method_not_allowed", fun () -> async {
-        let ctx = testContext ()
+        let ctx = freshContext ()
         let! r = dispatch [itemsSlice] (testReq "DELETE" "items" Map.empty) ctx
         if r.Status <> 405 then fail $"expected 405, got {r.Status}"
     }
@@ -547,7 +630,7 @@ let runTests () : Async<int> =
     }
 
 // ═════════════════════════════════════════════════════════════════════
-// 12. RUNTIME
+// 13. RUNTIME
 // ═════════════════════════════════════════════════════════════════════
 
 let argv  = Environment.GetCommandLineArgs() |> Array.skip 1
@@ -558,7 +641,7 @@ if runCi then
     let failed = runTests () |> Async.RunSynchronously
     exit failed
 
-let slices : Slice list = [ itemsSlice ]   // ← новые фичи сюда
+let slices : Slice list = [ itemsSlice ]
 
 let handleRequest (listenerCtx: HttpListenerContext) : Async<unit> =
     async {
