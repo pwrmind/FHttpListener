@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────
-// ADR × VERTICAL SLICING — F# STARTER (single file, one NuGet)
+// ADR × VERTICAL SLICING — F# STARTER (single file, two NuGet)
 // ─────────────────────────────────────────────────────────────────────
 //
 // Идея. Весь конвейер ADR выражается одним type alias:
@@ -11,24 +11,27 @@
 // Kernel — match по route, без рефлексии, без атрибутов.
 //
 // ── ЗАВИСИМОСТИ ───────────────────────────────────────────────────
-//   dotnet add package Microsoft.Data.Sqlite
+//   Microsoft.Data.Sqlite — БД.
+//   Fluid.Core            — Liquid-шаблоны в views/*.liquid.
 //   Всё остальное — BCL. System.Text.Json встроен.
 //
 // ── ИНВАРИАНТЫ ────────────────────────────────────────────────────
 //   Domain    : Request -> Context -> Async<Result<Outcome, DomainError>>
-//               только логика + SQL, не знает про HTML/JSON.
+//               только логика + SQL. Не знает про HTML/JSON.
 //               ОДИН срез = ОДИН запрос (или два, но не N+1).
 //               Каждый запрос — параметризован, поля перечислены явно.
 //   Responder : Result<Outcome, DomainError> -> Request -> Response
-//               только форматирование, не знает про БД.
+//               только форматирование. Не знает про БД.
 //   action    : Domain ∘ Responder → Handler.
 //   Middleware: Handler -> Handler (оборачивает, не фильтрует).
 //   Context   : единственный DI. Никаких глобалов в domain.
+//   Templates : весь HTML — в views/*.liquid. F#-код HTML не содержит.
 //
 // ── КАК ДОБАВИТЬ ФИЧУ ─────────────────────────────────────────────
-//   1. Скопируй блок `items` (Domain + View + Slice).
-//   2. Поменяй SQL/логику и имя в `Name = "items"`.
-//   3. Добавь срез в список `slices` внизу.
+//   1. Скопируй блок `items` (Domain + Slice).
+//   2. Добавь views/<name>.liquid.
+//   3. Поменяй SQL и имя в `Name = "items"`.
+//   4. Добавь срез в список `slices` внизу.
 //
 // ── ЗАПУСК ────────────────────────────────────────────────────────
 //   dotnet run                     → сервер на :8080
@@ -42,7 +45,9 @@ open System.IO
 open System.Net
 open System.Text
 open System.Text.Json
+open System.Collections.Concurrent
 open Microsoft.Data.Sqlite
+open Fluid
 
 // ═════════════════════════════════════════════════════════════════════
 // 1. ДАННЫЕ — records без поведения
@@ -76,12 +81,8 @@ type AuthState = {
     CsrfToken: string
 }
 
-// Доменный тип — конкретен для среза, но объявлен здесь как данные.
 type Item = { Id: string; Title: string; CreatedAt: DateTime }
 
-// Context — единственная точка DI. Db — открытое соединение,
-// живёт всё время работы приложения (для SQLite это правильно:
-// файл-хэндл один, SQLite сам сериализует записи).
 type Context = {
     Db:     SqliteConnection
     Config: Map<string, string>
@@ -130,7 +131,6 @@ let action (domain: Domain) (responder: Responder) : Handler =
         return Ok (responder result req)
     }
 
-// CE result { } для Async<Result<_,_>> — для случаев с цепочками.
 type AsyncResultBuilder() =
     member _.Bind(m: Async<Result<'a,'e>>, f: 'a -> Async<Result<'b,'e>>) =
         async {
@@ -149,7 +149,6 @@ let result = AsyncResultBuilder()
 // ═════════════════════════════════════════════════════════════════════
 
 module Db =
-    /// Открыть соединение и применить миграции.
     let openAndMigrate (path: string) : SqliteConnection =
         let conn = new SqliteConnection($"Data Source={path}")
         conn.Open()
@@ -169,7 +168,6 @@ module Db =
         cmd.ExecuteNonQuery() |> ignore
         conn
 
-    /// In-memory соединение с применёнными миграциями — для тестов.
     let inMemory () : SqliteConnection =
         let conn = new SqliteConnection("Data Source=:memory:")
         conn.Open()
@@ -186,67 +184,57 @@ module Db =
         conn
 
 // ═════════════════════════════════════════════════════════════════════
-// 5. VIEWS — обычные функции, никаких .phtml
+// 5. TEMPLATES — Fluid.Core
 // ═════════════════════════════════════════════════════════════════════
 
-module Views =
-    let private esc (s: string) = WebUtility.HtmlEncode s
+module Templates =
+    /// Singleton parser. Thread-safe.
+    let private parser = new FluidParser()
 
-    let layout (title: string) (content: string) =
-        $"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8"><title>{esc title}</title>
-<style>
-    body {{ font:16px/1.5 system-ui,sans-serif; max-width:640px; margin:40px auto; padding:0 20px; }}
-    nav  {{ margin-bottom:24px; padding-bottom:12px; border-bottom:1px solid #eee; }}
-    nav a {{ margin-right:12px; color:#06c; text-decoration:none; }}
-    .item {{ border:1px solid #eee; border-radius:6px; padding:10px 14px; margin:6px 0;
-             display:flex; justify-content:space-between; align-items:center; }}
-    .item form {{ display:inline; }}
-    .error {{ background:#fee; color:#900; padding:12px; border-radius:6px; margin:12px 0; }}
-    input[type=text] {{ padding:8px 10px; font-size:16px; border:1px solid #ccc; border-radius:4px; }}
-    button {{ padding:8px 14px; border:1px solid #ccc; border-radius:4px; background:#f6f6f6; cursor:pointer; }}
-</style>
-</head>
-<body>
-<nav>
-    <strong>Starter</strong>
-    <a href="?action=items">HTML</a>
-    <a href="?action=items&amp;format=json">JSON</a>
-</nav>
-<main>{content}</main>
-</body>
-</html>"""
+    /// Кэш распарсенных шаблонов. IFluidTemplate — thread-safe.
+    let private cache = ConcurrentDictionary<string, IFluidTemplate>()
 
-    let error (title: string) (message: string) =
-        $"<h1>{esc title}</h1><p>{esc message}</p><p><a href=\"?action=items\">← назад</a></p>"
+    /// Директория с шаблонами. Рядом с исполняемым файлом.
+    let private viewsDir = Path.Combine(AppContext.BaseDirectory, "views")
 
-    type ItemsView = { Items: Item list }
+    /// Общие опции: white-list полей, регистрация типа Item.
+    let private makeOptions () =
+        let options = TemplateOptions()
+        // Белый список: только поля Item доступны в шаблоне.
+        // Fluid делает lookup регистронезависимым — `item.id` найдёт `Id`.
+        options.MemberAccessStrategy.Register<Item>() |> ignore
+        options
 
-    let items (data: obj) : string =
-        let v = data :?> ItemsView
-        let rows =
-            if List.isEmpty v.Items then "<p style=\"color:#888\">Пока ничего нет.</p>"
-            else
-                v.Items
-                |> List.map (fun i ->
-                    $"""<div class="item"><span>{esc i.Title}</span>
-<form method="post" action="?action=items">
-<input type="hidden" name="csrf_token" value="dev-token">
-<input type="hidden" name="op" value="delete">
-<input type="hidden" name="id" value="{esc i.Id}">
-<button>×</button>
-</form></div>""")
-                |> String.concat ""
-        $"""<h1>Items</h1>
-<form method="post" action="?action=items" style="margin-bottom:20px">
-<input type="hidden" name="csrf_token" value="dev-token">
-<input type="hidden" name="op" value="create">
-<input type="text" name="title" required minlength="2" placeholder="Название" autofocus>
-<button>Добавить</button>
-</form>
-{rows}"""
+    /// Загрузить и распарсить шаблон (с кэшированием).
+    let private load (name: string) : IFluidTemplate =
+        cache.GetOrAdd(name, fun n ->
+            let path = Path.Combine(viewsDir, n + ".liquid")
+            if not (File.Exists path) then
+                failwith $"Template not found: {path}"
+            let source = File.ReadAllText(path, Encoding.UTF8)
+
+            // Явно указываем компилятору использовать 3-параметрную перегрузку
+            let mutable template = Unchecked.defaultof<IFluidTemplate>
+            let mutable error = ""
+            let ok = parser.TryParse(source, &template, &error)
+            if ok then template
+            else failwith $"Template parse error in {n}.liquid: {error}")
+
+    /// Отрендерить шаблон с моделью (Map<string, obj>).
+    let render (name: string) (model: Map<string, obj>) : string =
+        let template = load name
+        let ctx = TemplateContext(makeOptions ())
+        for KeyValue (k, v) in model do
+            ctx.SetValue(k, v) |> ignore
+        template.Render(ctx)
+
+    /// Отрендерить layout с уже готовым контентом.
+    let renderLayout (title: string) (content: string) (model: Map<string, obj>) : string =
+        let full =
+            model
+            |> Map.add "title"   (box title)
+            |> Map.add "content" (box content)
+        render "_layout" full
 
 // ═════════════════════════════════════════════════════════════════════
 // 6. RESPONSES + RESPONDERS
@@ -267,16 +255,24 @@ let private jsonOptions =
 let private serialize (value: obj) : string =
     JsonSerializer.Serialize(value, value.GetType(), jsonOptions)
 
-let htmlResponder (view: obj -> string) (title: string) : Responder =
+/// HTML-responder: рендерит <view>.liquid и оборачивает в _layout.liquid.
+let htmlResponder (viewName: string) (pageTitle: string) : Responder =
     fun result _req ->
         match result with
         | Ok (Show data) ->
-            htmlBody 200 (Views.layout title (view data))
+            let model = data :?> Map<string, obj>
+            let content = Templates.render viewName model
+            htmlBody 200 (Templates.renderLayout pageTitle content model)
+
         | Ok (Redirect url) ->
             { Status = 302; Headers = Map [ "Location", url ]; Body = "" }
+
         | Error e ->
             let s = httpStatus e
-            htmlBody s (Views.layout (string s) (Views.error (string s) (errorMessage e)))
+            let model = Map [ "status"  , box s
+                              "message" , box (errorMessage e) ]
+            let content = Templates.render "error" model
+            htmlBody s (Templates.renderLayout (string s) content model)
 
 let jsonResponder : Responder =
     fun result _req ->
@@ -319,13 +315,13 @@ let withAuth : Middleware =
     }
 
 // ═════════════════════════════════════════════════════════════════════
-// 8. FEATURE — единственный эталонный срез (SQL-паттерн)
+// 8. FEATURE — единственный эталонный срез (SQL + Fluid)
 // ═════════════════════════════════════════════════════════════════════
 
 let itemsList : Domain =
     fun _req ctx ->
         async {
-            // Один запрос. Явные поля. Сортировка в БД, не в памяти.
+            // Один запрос. Явные поля. Сортировка в БД.
             use cmd = ctx.Db.CreateCommand()
             cmd.CommandText <-
                 "SELECT id, title, created_at FROM items ORDER BY created_at DESC"
@@ -340,7 +336,9 @@ let itemsList : Domain =
                                         CultureInfo.InvariantCulture,
                                         DateTimeStyles.RoundtripKind)
                     } ]
-            return Ok (Show (box { Views.ItemsView.Items = items }))
+            // Модель для Fluid: ключи становятся переменными в шаблоне.
+            let model = Map [ "items", box items ]
+            return Ok (Show (box model))
         }
 
 let itemsCreate : Domain =
@@ -351,7 +349,6 @@ let itemsCreate : Domain =
                 return Error (Validation "Название минимум 2 символа.")
             else
                 let id = "i_" + Guid.NewGuid().ToString("N").Substring(0, 8)
-                // Параметризованный INSERT. Никакой конкатенации строк.
                 use cmd = ctx.Db.CreateCommand()
                 cmd.CommandText <-
                     "INSERT INTO items (id, title, created_at) VALUES (@id, @title, @now)"
@@ -386,7 +383,8 @@ let routeKey (r: Request) : string =
     else r.Method
 
 let itemsSlice : Slice =
-    let responder = negotiatingResponder (htmlResponder Views.items "Items") jsonResponder
+    let html = htmlResponder "items" "Items"
+    let responder = negotiatingResponder html jsonResponder
     { Name = "items"
       Routes = Map [
           "GET",         action itemsList   responder
@@ -403,8 +401,10 @@ let renderError (wantsJson: bool) (e: DomainError) : Response =
         let msg = JsonSerializer.Serialize(errorMessage e)
         jsonBody (httpStatus e) ("{\"error\":" + msg + "}")
     else
-        htmlBody (httpStatus e) (Views.layout (string (httpStatus e))
-                                       (Views.error (string (httpStatus e)) (errorMessage e)))
+        let s = httpStatus e
+        let model = Map [ "status", box s; "message", box (errorMessage e) ]
+        let content = Templates.render "error" model
+        htmlBody s (Templates.renderLayout (string s) content model)
 
 let dispatch (slices: Slice list) (req: Request) (ctx: Context) : Async<Response> =
     async {
@@ -485,7 +485,7 @@ let emit (resp: Response) (ctx: HttpListenerContext) : Async<unit> =
     }
 
 // ═════════════════════════════════════════════════════════════════════
-// 11. ХРАНИЛИЩЕ + ЛОГГЕР (MailboxProcessor)
+// 11. ХРАНИЛИЩЕ + ЛОГГЕР
 // ═════════════════════════════════════════════════════════════════════
 
 type Logger() =
@@ -499,9 +499,6 @@ type Logger() =
     member _.Log(msg) = agent.Post msg
 
 let globalLogger = Logger()
-
-// Одно соединение на приложение. SQLite сам сериализует записи.
-// Для Postgres здесь был бы пул — Context хранил бы DataSource.
 let globalDb = Db.openAndMigrate "app.db"
 
 let contextOf (req: Request) : Context =
@@ -542,8 +539,8 @@ let tests : (string * (unit -> Async<unit>)) list = [
         if r.Status <> 422 then fail $"expected 422, got {r.Status}"
         use cmd = ctx.Db.CreateCommand()
         cmd.CommandText <- "SELECT COUNT(*) FROM items"
-        let n = Convert.ToInt32(cmd.ExecuteScalar())
-        if n <> 0 then fail "should not insert on validation error"
+        if Convert.ToInt32(cmd.ExecuteScalar()) <> 0 then
+            fail "should not insert on validation error"
     }
 
     "items/create_then_list", fun () -> async {
@@ -569,8 +566,8 @@ let tests : (string * (unit -> Async<unit>)) list = [
         if r.Status <> 403 then fail $"expected 403, got {r.Status}"
         use cmd = ctx.Db.CreateCommand()
         cmd.CommandText <- "SELECT COUNT(*) FROM items"
-        let n = Convert.ToInt32(cmd.ExecuteScalar())
-        if n <> 0 then fail "should not insert on CSRF failure"
+        if Convert.ToInt32(cmd.ExecuteScalar()) <> 0 then
+            fail "should not insert on CSRF failure"
     }
 
     "items/json_negotiation", fun () -> async {

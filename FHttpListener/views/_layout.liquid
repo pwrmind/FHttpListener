@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>{{ title }}</title>
+    <style>
+        body { font: 16px/1.5 system-ui, sans-serif; max-width: 640px;
+               margin: 40px auto; padding: 0 20px; color: #222; }
+        nav { margin-bottom: 24px; padding-bottom: 12px;
+              border-bottom: 1px solid #eee; }
+        nav a { margin-right: 12px; color: #06c; text-decoration: none; }
+        nav a:hover { text-decoration: underline; }
+        .item { border: 1px solid #eee; border-radius: 6px;
+                padding: 10px 14px; margin: 6px 0;
+                display: flex; justify-content: space-between;
+                align-items: center; }
+        .item form { display: inline; }
+        .error { background: #fee; color: #900; padding: 12px;
+                 border-radius: 6px; margin: 12px 0; }
+        input[type=text] { padding: 8px 10px; font-size: 16px;
+                           border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 8px 14px; font-size: 15px; cursor: pointer;
+                 border: 1px solid #ccc; border-radius: 4px;
+                 background: #f6f6f6; }
+        button:hover { background: #eee; }
+        .meta { color: #888; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <nav>
+        <strong>Starter</strong>
+        <a href="?action=items">HTML</a>
+        <a href="?action=items&amp;format=json">JSON</a>
+    </nav>
+
+    <main>{{ content | raw }}</main>
+</body>
+</html>

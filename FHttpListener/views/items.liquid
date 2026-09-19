@@ -1,0 +1,33 @@
+<h1>Items</h1>
+
+{% if error %}
+    <div class="error">{{ error }}</div>
+{% endif %}
+
+<form method="post" action="?action=items" style="margin-bottom:20px">
+    <input type="hidden" name="csrf_token" value="dev-token">
+    <input type="hidden" name="op" value="create">
+    <input type="text" name="title" placeholder="Название"
+           required minlength="2" autofocus>
+    <button type="submit">Добавить</button>
+</form>
+
+{% if items.size == 0 %}
+    <p class="meta">Пока ничего нет.</p>
+{% else %}
+    {% for item in items %}
+        <div class="item">
+            <div>
+                <strong>{{ item.Title }}</strong>
+                <div class="meta">{{ item.CreatedAt }}</div>
+            </div>
+            <form method="post" action="?action=items"
+                  onsubmit="return confirm('Удалить?')">
+                <input type="hidden" name="csrf_token" value="dev-token">
+                <input type="hidden" name="op" value="delete">
+                <input type="hidden" name="id" value="{{ item.Id }}">
+                <button type="submit">×</button>
+            </form>
+        </div>
+    {% endfor %}
+{% endif %}
