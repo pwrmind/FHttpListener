@@ -11,4 +11,15 @@
 
   <ItemGroup />
 
+  <ItemGroup>
+    <PackageReference Include="Fluid.Core" Version="2.40.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="views/**/*.liquid">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>
