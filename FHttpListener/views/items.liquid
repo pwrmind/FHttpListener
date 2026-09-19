@@ -18,7 +18,7 @@
     {% for item in items %}
         <div class="item">
             <div>
-                <strong>{{ item.Title }}</strong>
+                <strong><a href="?action=items&op=detail&id={{ item.Id }}">{{ item.Title }}</a></strong>
                 <div class="meta">{{ item.CreatedAt }}</div>
             </div>
             <form method="post" action="?action=items"

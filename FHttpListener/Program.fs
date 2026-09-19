@@ -375,19 +375,52 @@ let itemsDelete : Domain =
                 return Ok (Redirect "?action=items")
         }
 
+let itemsDetail : Domain =
+    fun req ctx ->
+        async {
+            match req.Params.TryFind "id" with
+            | None | Some "" ->
+                return Error (Validation "Не указан id.")
+            | Some id ->
+                // Один запрос. Явные поля. Поиск по первичному ключу.
+                use cmd = ctx.Db.CreateCommand()
+                cmd.CommandText <-
+                    "SELECT id, title, created_at FROM items WHERE id = @id"
+                cmd.Parameters.AddWithValue("@id", id) |> ignore
+                use reader = cmd.ExecuteReader()
+                if reader.Read() then
+                    let item = {
+                        Id        = reader.GetString 0
+                        Title     = reader.GetString 1
+                        CreatedAt = DateTime.Parse(
+                                        reader.GetString 2,
+                                        CultureInfo.InvariantCulture,
+                                        DateTimeStyles.RoundtripKind)
+                    }
+                    return Ok (Show (box (Map [ "item", box item ])))
+                else
+                    return Error NotFound
+        }
+
 type Slice = { Name: string; Routes: Map<string, Handler> }
 
 let routeKey (r: Request) : string =
-    if r.Method = "POST" then
-        "POST:" + (r.Body.TryFind "op" |> Option.defaultValue "")
-    else r.Method
+    match r.Method, r.Params.TryFind "op" with
+    | "POST", Some o -> "POST:" + o
+    | "POST", None   -> "POST:"
+    | "GET",  Some o -> "GET:" + o
+    | "GET",  None   -> "GET"
+    | m, _           -> m
 
 let itemsSlice : Slice =
     let html = htmlResponder "items" "Items"
+    let htmlDetail = htmlResponder "item_detail" "Item"    // ← новый responder
     let responder = negotiatingResponder html jsonResponder
+    let responderDetail = negotiatingResponder htmlDetail jsonResponder
     { Name = "items"
       Routes = Map [
           "GET",         action itemsList   responder
+          "GET:detail",  action itemsDetail responderDetail   // ← новая строка
           "POST:create", action itemsCreate responder |> withCsrf
           "POST:delete", action itemsDelete responder |> withCsrf
       ] }
@@ -607,6 +640,28 @@ let tests : (string * (unit -> Async<unit>)) list = [
         let ctx = freshContext ()
         let! r = dispatch [itemsSlice] (testReq "DELETE" "items" Map.empty) ctx
         if r.Status <> 405 then fail $"expected 405, got {r.Status}"
+    }
+
+    "items/detail_shows_item", fun () -> async {
+        let ctx = freshContext ()
+        let! _ = dispatch [itemsSlice] (testReq "POST" "items"
+                    (Map [ "op", "create"; "title", "Detail"; "csrf_token", "test-token" ])) ctx
+        use get = ctx.Db.CreateCommand()
+        get.CommandText <- "SELECT id FROM items LIMIT 1"
+        let id = get.ExecuteScalar() :?> string
+        let req = { testReq "GET" "items" Map.empty with
+                        Params = Map [ "op", "detail"; "id", id ] }
+        let! r = dispatch [itemsSlice] req ctx
+        if r.Status <> 200 then fail $"expected 200, got {r.Status}"
+        if not (r.Body.Contains "Detail") then fail "detail not shown"
+    }
+
+    "items/detail_not_found", fun () -> async {
+        let ctx = freshContext ()
+        let req = { testReq "GET" "items" Map.empty with
+                        Params = Map [ "op", "detail"; "id", "nonexistent" ] }
+        let! r = dispatch [itemsSlice] req ctx
+        if r.Status <> 404 then fail $"expected 404, got {r.Status}"
     }
 ]
 
