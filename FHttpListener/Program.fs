@@ -405,12 +405,13 @@ let itemsDetail : Domain =
 type Slice = { Name: string; Routes: Map<string, Handler> }
 
 let routeKey (r: Request) : string =
-    match r.Method, r.Params.TryFind "op" with
-    | "POST", Some o -> "POST:" + o
-    | "POST", None   -> "POST:"
-    | "GET",  Some o -> "GET:" + o
-    | "GET",  None   -> "GET"
-    | m, _           -> m
+    match r.Method with
+    | "POST" -> "POST:" + (r.Body.TryFind "op" |> Option.defaultValue "")
+    | "GET"  ->
+        match r.Params.TryFind "op" with
+        | Some o -> "GET:" + o
+        | None   -> "GET"
+    | m -> m
 
 let itemsSlice : Slice =
     let html = htmlResponder "items" "Items"
@@ -587,7 +588,7 @@ let tests : (string * (unit -> Async<unit>)) list = [
     "items/redirect_after_create", fun () -> async {
         let ctx = freshContext ()
         let! r = dispatch [itemsSlice] (testReq "POST" "items"
-                    (Map [ "op", "create"; "title", "A"; "csrf_token", "test-token" ])) ctx
+                    (Map [ "op", "create"; "title", "AB"; "csrf_token", "test-token" ])) ctx   // ← было "A"
         if r.Status <> 302 then fail $"expected 302, got {r.Status}"
         if r.Headers.TryFind "Location" <> Some "?action=items" then fail "wrong Location"
     }
